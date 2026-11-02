@@ -95,6 +95,9 @@ NmbBuffer *nmb_buffer_new_no_copy(NmbDevice *, void *pointer, uint64_t length, u
 NmbBuffer *nmb_buffer_new_no_copy_releasing(NmbDevice *, void *pointer, uint64_t length, uint64_t options,
                                             void (*release)(void *context, void *pointer, uint64_t length), void *context);
 void nmb_buffer_release(NmbBuffer *);
+bool nmb_buffer_make_aliasable(const NmbBuffer *);
+bool nmb_buffer_is_aliasable(const NmbBuffer *);
+uint64_t nmb_buffer_heap_offset(const NmbBuffer *);
 void *nmb_buffer_contents(const NmbBuffer *);
 uint64_t nmb_buffer_length(const NmbBuffer *);
 uint64_t nmb_buffer_gpu_address(const NmbBuffer *);
@@ -129,6 +132,9 @@ NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, c
 uint64_t nmb_texture_set_purgeable_state(const NmbTexture *, uint64_t state);
 uint64_t nmb_buffer_set_purgeable_state(const NmbBuffer *, uint64_t state);
 void nmb_texture_release(NmbTexture *);
+bool nmb_texture_make_aliasable(const NmbTexture *);
+bool nmb_texture_is_aliasable(const NmbTexture *);
+uint64_t nmb_texture_heap_offset(const NmbTexture *);
 void nmb_texture_describe(const NmbTexture *, struct NmbTextureDescriptor *out);
 bool nmb_texture_replace(NmbTexture *, const uint64_t region[6], uint64_t level, uint64_t slice, const void *bytes, uint64_t bytes_per_row,
                          uint64_t bytes_per_image, uint64_t length);

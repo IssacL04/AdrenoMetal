@@ -996,8 +996,6 @@ static void waitForResource(id resource);
 // (memory attribution is the kernel driver's, by the importing task), refused as not supported.
 #define NB_RESOURCE_SPI \
 - (uint64_t)protectionOptions {return 0;} \
-- (id<MTLHeap>)heap {return _parentHeap;} \
-- (BOOL)isAliasable {return NO;} \
 - (int)setOwnerWithIdentity:(unsigned)identity {(void)identity;return 46; /* KERN_NOT_SUPPORTED */} \
 - (void)waitUntilComplete {waitForResource(self);}
 @interface NBBuffer : NBObject
@@ -1005,7 +1003,7 @@ static void waitForResource(id resource);
 @property(nonatomic) MTLResourceOptions options;
 @property(nonatomic) void *wrapped;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
-@property(nonatomic) NSUInteger heapOffset;
+@property(nonatomic,readonly) NSUInteger heapOffset;
 // A surface import's own surface object, which the runtime buffer retains until it is freed (surfaceBuffer); nullptr otherwise.
 @property(nonatomic) IOSurfaceRef importedSurface;
 @end
@@ -1019,7 +1017,7 @@ static void waitForResource(id resource);
 @property(nonatomic) NSUInteger offset,rowBytes;
 @property(nonatomic,strong) id<MTLTexture> parent;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
-@property(nonatomic) NSUInteger heapOffset;
+@property(nonatomic,readonly) NSUInteger heapOffset;
 @property(nonatomic) BOOL counted;   // its surface counted in use (countUse)
 - (void)countUse;
 @end
@@ -1035,6 +1033,12 @@ static void releaseBlock(void *context,void *pointer,uint64_t length) {
 }
 static void releaseSurface(void *context,void *,uint64_t) {gSurfaceImportsReleased++;CFRelease((IOSurfaceRef)context);}
 @implementation NBBuffer
+- (id<MTLHeap>)heap {return _parentHeap;}
+- (NSUInteger)heapOffset {return nmb_buffer_heap_offset(_handle);}
+- (BOOL)isAliasable {return nmb_buffer_is_aliasable(_handle);}
+- (void)makeAliasable {
+ if(!nmb_buffer_make_aliasable(_handle))NBLOG(@"native-metal: buffer makeAliasable refused: %@",lastError());
+}
 - (void)dealloc {
  nmb_buffer_release(_handle);
 }
@@ -1229,6 +1233,12 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
  return true;
 }
 @implementation NBTexture
+- (id<MTLHeap>)heap {return _parentHeap?:(_parent?[(id)_parent heap]:(_buffer?[(id)_buffer heap]:nil));}
+- (NSUInteger)heapOffset {return nmb_texture_heap_offset(_handle);}
+- (BOOL)isAliasable {return nmb_texture_is_aliasable(_handle);}
+- (void)makeAliasable {
+ if(!nmb_texture_make_aliasable(_handle))NBLOG(@"native-metal: texture makeAliasable refused: %@",lastError());
+}
 - (void)dealloc {nmb_texture_release(_handle);if(_surface){if(_counted)IOSurfaceDecrementUseCount(_surface);CFRelease(_surface);}}
 - (void)countUse {if(_surface && !_counted && gCountsSurfaceUse){IOSurfaceIncrementUseCount(_surface);_counted=YES;}}
 - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
@@ -3719,7 +3729,7 @@ static char dvmMemoryReleaseKey;
  NmbBuffer *handle=nmb_heap_new_buffer(_handle,length,options,offset);
  if(!handle){NBLOG(@"native-metal: heap buffer refused: %@",lastError());return nil;}
  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.parentHeap=(id<MTLHeap>)self;
- buffer.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLBuffer>)buffer;
+ return (id<MTLBuffer>)buffer;
 }
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {return [self bufferWithLength:length options:options offset:UINT64_MAX];}
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(NSUInteger)offset {
@@ -3747,7 +3757,7 @@ static char dvmMemoryReleaseKey;
  }
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  if(isPvrtc(d.pixelFormat))texture.pvrtc=(uint32_t)d.pixelFormat;
- texture.parentHeap=(id<MTLHeap>)self;texture.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLTexture>)texture;
+ texture.parentHeap=(id<MTLHeap>)self;return (id<MTLTexture>)texture;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {return [self textureWithDescriptor:d offset:UINT64_MAX];}
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset {return [self textureWithDescriptor:d offset:offset];}
@@ -3849,8 +3859,11 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 @implementation NBDeviceMethods
 - (NSString *)name {return gName;}
 // MPSCore reads the GPU core count of every Apple GPU family (no count: no MPS device, and its image cache is nil); the Adreno's
-// shader processors count as eight cores, which only sizes MPS's kernel choices.
-- (NSUInteger)gpuCoreCount {return 8;}
+// shader processor count sizes MPS's kernel choices; the board build supplies its verified topology.
+#ifndef NATIVE_ADRENO_SP_CORES
+#define NATIVE_ADRENO_SP_CORES 8
+#endif
+- (NSUInteger)gpuCoreCount {return NATIVE_ADRENO_SP_CORES;}
 // A texture over a buffer starts where a linear texture may: the texel-buffer alignment the runtime answers for the linear one.
 - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format {
  return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),format);

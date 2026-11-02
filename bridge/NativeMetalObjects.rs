@@ -933,6 +933,24 @@ pub extern "C" fn nmb_buffer_release(buffer: *mut NmbBuffer) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_make_aliasable(buffer: *const NmbBuffer) -> bool {
+    guard(false, || {
+        get(buffer)?.0.make_aliasable().map_err(e("buffer makeAliasable"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_is_aliasable(buffer: *const NmbBuffer) -> bool {
+    guard(false, || Ok(get(buffer)?.0.is_aliasable()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_heap_offset(buffer: *const NmbBuffer) -> u64 {
+    guard(0, || Ok(get(buffer)?.0.heap_offset()))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn nmb_buffer_contents(buffer: *const NmbBuffer) -> *mut c_void {
     guard(std::ptr::null_mut(), || Ok(get(buffer)?.0.contents().map_or(std::ptr::null_mut(), |p| p.as_ptr() as *mut c_void)))
 }
@@ -1179,6 +1197,24 @@ pub extern "C" fn nmb_buffer_set_purgeable_state(buffer: *const NmbBuffer, state
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_release(texture: *mut NmbTexture) {
     release(texture)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_make_aliasable(texture: *const NmbTexture) -> bool {
+    guard(false, || {
+        get(texture)?.0.make_aliasable().map_err(e("texture makeAliasable"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_is_aliasable(texture: *const NmbTexture) -> bool {
+    guard(false, || Ok(get(texture)?.0.is_aliasable()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_heap_offset(texture: *const NmbTexture) -> u64 {
+    guard(0, || Ok(get(texture)?.0.heap_offset()))
 }
 
 #[unsafe(no_mangle)]

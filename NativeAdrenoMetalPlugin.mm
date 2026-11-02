@@ -93,6 +93,7 @@ static bool bootArgSet(const char *key) {
     size_t size = sizeof args - 1;
     return sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0 && strstr(args, key);
 }
+#if defined(__arm64e__)
 static unsigned patchFramebufferBranch(uintptr_t slide) {
     const uintptr_t site = 0x184461928 + slide;
     uint32_t word = 0;
@@ -109,6 +110,7 @@ static unsigned patchFramebufferBranch(uintptr_t slide) {
     if (!restored) return 0x6E53;
     return 0x6E42;
 }
+#endif
 static unsigned gReports;
 struct DisplaySample {unsigned flags = 0, mode = 0, behaviour = 0, globals = 0; uint16_t display = 0; uintptr_t object = 0;};
 static DisplaySample sampleDisplay(id first, intptr_t slide) {

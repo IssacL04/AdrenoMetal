@@ -14,7 +14,7 @@
 #include <initializer_list>
 #include "NativeAdrenoABI.h"
 #include "NativeTurnipSmoke.h"
-#if __has_include("TurnipReplay.h")
+#if !defined(NATIVE_ADRENO_SKIP_A740_REPLAY) && __has_include("TurnipReplay.h")
 #include "TurnipReplay.h"
 #define NATIVE_TURNIP_REPLAY 1
 #endif

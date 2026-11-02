@@ -8,8 +8,10 @@
 #import <Metal/Metal.h>
 #include <mach/mach_time.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include "GpuScanoutPresenter.h"
+#include "NativeGOPWire.h"
 
 extern "C" void NBWaitInFlight(uint64_t beforeUs) __attribute__((weak_import));
 extern "C" void NBTraceSwap(uint64_t offered,uint64_t copied,uint64_t completed,uint32_t sequence,uint32_t result) __attribute__((weak_import));
@@ -39,10 +41,12 @@ struct Stats {
 
 class Client {
 public:
+    ~Client() {delete presenter_;}
     // Reads the mode and maps the scanout; false with stats.step telling where it stopped.
     bool open(id<MTLDevice> device, const Transport &transport, Stats *stats) {
         transport_ = transport;
         stats_ = stats;
+        diagnostics_=getenv("SHENG_DIAG")!=nullptr;
         NGPMode mode = {};
         note(0x6710);
         int status = transport_.call(transport_.context, NGP_METHOD_MODE, nullptr, 0, &mode, sizeof mode);
@@ -58,6 +62,14 @@ public:
         // The mapping covers whole pages; the framebuffer allocation ends on a page boundary, the copy never writes past the last row.
         gpupresent::Scanout scanout = {(void *)(uintptr_t)address, (size_t)((mode.bytes + page - 1) & ~(page - 1)), (size_t)mode.stride,
                                        (uint32_t)mode.width, (uint32_t)mode.height};
+#ifdef NGP_OVERLAY_API
+        NGPOverlay overlay={};
+        status=transport_.call(transport_.context,NGP_METHOD_OVERLAY,nullptr,0,&overlay,sizeof overlay);
+        if(!status) {
+            if(overlay.first>mode.height || overlay.rows>mode.height-overlay.first)return fail(3,-1);
+            scanout.overlayFirst=overlay.first;scanout.overlayRows=overlay.rows;
+        } else if((unsigned)status!=0xe00002c7u)return fail(3,status);
+#endif
         note(0x6714);
         scanout_ = scanout;
         presenter_ = new gpupresent::Presenter(device, scanout);
@@ -80,15 +92,12 @@ public:
             return false;
         }
         const size_t page = (size_t)getpagesize();
-        {   // measurement: the second half of the run copies half the rows
-            static uint64_t first = 0;
-            const uint64_t nowS = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000000ull;
-            if (!first) first = nowS;
-            (void)first; gpupresent::gHalfRows.store(false, std::memory_order_relaxed);
-        }
-        note(0x6730);   // a frame was offered
+        if(diagnostics_ || !stats_->frames)note(0x6730);
         const uint64_t offeredUs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
         if (NBWaitInFlight) NBWaitInFlight(offeredUs);
+#ifdef NGP_TIMING_API
+        const uint32_t syncUs=gpupresent::elapsedUs(offeredUs);
+#endif
         const uint64_t began = mach_absolute_time();
         const gpupresent::Result r = presenter_->present({(const void *)(uintptr_t)swap.address, (size_t)((swap.bytes + page - 1) & ~(page - 1)),
                                                           (size_t)swap.stride, swap.width, swap.height, swap.reserved, swap.format});
@@ -100,10 +109,20 @@ public:
         }
         stats_->lastResult = (int)r;
         if (r == gpupresent::kOk && swap.format == NGP_BGRX8888 && stats_->verified < 4) verify(swap);
-        note(0x6731);   // the GPU copy returned
+        if(diagnostics_ || !stats_->frames)note(0x6731);
         const uint64_t copiedUs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
         NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};
-        const int completed = transport_.call(transport_.context, NGP_METHOD_COMPLETE_SWAP, &done, sizeof done, nullptr, 0);
+        int completed;
+#ifdef NGP_TIMING_API
+        if(timed_) {
+            const gpupresent::Timing &t=presenter_->timing();
+            NGPCompleteTimed measured={done,syncUs,t.encodeUs,t.submitUs,t.waitUs,t.gpuUs,0};
+            completed=transport_.call(transport_.context,NGP_METHOD_COMPLETE_SWAP,&measured,sizeof measured,nullptr,0);
+            if((unsigned)completed==0xe00002c2u || (unsigned)completed==0xe00002c7u)timed_=false;
+        }
+        if(!timed_)
+#endif
+            completed=transport_.call(transport_.context,NGP_METHOD_COMPLETE_SWAP,&done,sizeof done,nullptr,0);
         if (NBTraceSwap) NBTraceSwap(offeredUs, copiedUs, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000, (uint32_t)swap.sequence, (uint32_t)r);
         if (completed) {++stats_->failures; stats_->error = completed; return false;}
         if (r == gpupresent::kOk) ++stats_->frames; else ++stats_->failures;
@@ -117,6 +136,7 @@ private:
         const volatile uint32_t *shown = (const volatile uint32_t *)scanout_.base;
         const volatile uint32_t *surface = (const volatile uint32_t *)(uintptr_t)swap.address;
         for (uint32_t y = 0; y < rows; ++y) {
+            if (y >= scanout_.overlayFirst && y - scanout_.overlayFirst < scanout_.overlayRows) continue;
             const volatile uint32_t *a = shown + (size_t)y * (scanout_.stride / 4), *b = surface + (size_t)y * (swap.stride / 4);
             for (uint32_t x = 0; x < words; ++x)
                 if (a[x] != b[x]) {++stats_->mismatchRows; break;}
@@ -129,6 +149,10 @@ private:
     gpupresent::Presenter *presenter_ = nullptr;
     gpupresent::Scanout scanout_ = {};
     Stats *stats_ = nullptr;
+    bool diagnostics_=false;
+#ifdef NGP_TIMING_API
+    bool timed_=true;
+#endif
 };
 
 }  // namespace gpuscanout

@@ -13,7 +13,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <atomic>
-#include "../GopFramebuffer/NativeGOPWire.h"
+#include <time.h>
+#include "NativeGOPWire.h"
 #include "../GopFramebuffer/NativeHalfCodes.h"
 
 // The conversion kernel's AIR and the frontend's loader for bare AIR (both in the plugin; weak, so a device without them only blits).
@@ -30,6 +31,7 @@ struct Scanout {
     size_t bytes;     // whole extent, a multiple of the page size
     size_t stride;    // bytes per row
     uint32_t width, height;
+    uint32_t overlayFirst=0,overlayRows=0;
 };
 
 struct Frame {
@@ -42,6 +44,12 @@ struct Frame {
 };
 
 enum Result { kOk = 0, kBadFrame, kBadScanout, kNoResource, kGpuFailed };
+struct Timing {uint32_t encodeUs=0,submitUs=0,waitUs=0,gpuUs=UINT32_MAX;};
+inline uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
+inline uint32_t elapsedUs(uint64_t began) {
+    const uint64_t us=nowUs()-began;
+    return us>UINT32_MAX?UINT32_MAX:(uint32_t)us;
+}
 
 class Presenter {
 public:
@@ -51,8 +59,10 @@ public:
         target_ = [device newBufferWithBytesNoCopy:scanout.base length:scanout.bytes options:MTLResourceStorageModeShared deallocator:nil];
     }
     bool ready() const { return target_ != nil; }
+    const Timing &timing() const {return timing_;}
     // One frame: encodes the GPU copy, commits, waits for the GPU. Rows are copied as whole rows of width*4 bytes.
     Result present(const Frame &frame) {
+        timing_={};began_=nowUs();
         if (!ready()) return kBadScanout;
         if (frame.format == NGP_RGBA16F_LINEAR || frame.format == NGP_RGBA16F_ENCODED) return convert(frame);
         if (frame.format != NGP_BGRX8888) return kBadFrame;
@@ -63,27 +73,38 @@ public:
         const uint32_t rows = gHalfRows.load(std::memory_order_relaxed) ? frame.height / 2 : frame.height;
         id<MTLBuffer> source = sourceFor(frame);
         if (!source) return kNoResource;
+        uint32_t spans[4]={0,rows,rows,rows};
+#ifdef NGP_OVERLAY_API
+        ngp_visible_rows(frame.height,{scanout_.overlayFirst,scanout_.overlayRows},spans);
+#endif
         if (!(frame.stride & 3) && !(scanout_.stride & 3) && pipeline(opaque_, opaqueFailed_, @"scanout_opaque")) {
             id<MTLCommandBuffer> commands = [queue_ commandBuffer];
             id<MTLComputeCommandEncoder> encoder = commands ? [commands computeCommandEncoder] : nil;
             if (!encoder) return kNoResource;
-            const uint32_t params[4] = {frame.width, rows, (uint32_t)(frame.stride / 4), (uint32_t)(scanout_.stride / 4)};
             [encoder setComputePipelineState:opaque_];
-            [encoder setBuffer:source offset:0 atIndex:0];
-            [encoder setBuffer:target_ offset:0 atIndex:1];
-            [encoder setBytes:params length:sizeof params atIndex:3];
-            [encoder dispatchThreadgroups:MTLSizeMake((frame.width + 15) / 16, (rows + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+            for(unsigned part=0;part<2;++part) {
+                const uint32_t first=spans[2*part]<rows?spans[2*part]:rows;
+                const uint32_t end=spans[2*part+1]<rows?spans[2*part+1]:rows;
+                if(end<=first)continue;
+                const uint32_t params[4] = {frame.width, end-first, (uint32_t)(frame.stride / 4), (uint32_t)(scanout_.stride / 4)};
+                [encoder setBuffer:source offset:first*frame.stride atIndex:0];
+                [encoder setBuffer:target_ offset:first*scanout_.stride atIndex:1];
+                [encoder setBytes:params length:sizeof params atIndex:3];
+                [encoder dispatchThreadgroups:MTLSizeMake((frame.width + 15) / 16, (end-first + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+            }
             [encoder endEncoding];
-            [commands commit];
-            [commands waitUntilCompleted];
-            return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
+            return finish(commands);
         }
         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
         id<MTLBlitCommandEncoder> blit = commands ? [commands blitCommandEncoder] : nil;
         if (!blit) return kNoResource;
+        for(unsigned part=0;part<2;++part) {
+        const uint32_t first=spans[2*part]<rows?spans[2*part]:rows;
+        const uint32_t end=spans[2*part+1]<rows?spans[2*part+1]:rows;
+        if(end<=first)continue;
         if (frame.stride == scanout_.stride) {
             // Equal pitch: the rows are one contiguous run.
-            [blit copyFromBuffer:source sourceOffset:0 toBuffer:target_ destinationOffset:0 size:frame.stride * (rows - 1) + row];
+            [blit copyFromBuffer:source sourceOffset:first*frame.stride toBuffer:target_ destinationOffset:first*scanout_.stride size:frame.stride * (end-first-1) + row];
         } else {
             // A linear texture over the surface pages reads them with the surface's pitch and writes the scanout's pitch.
             MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:frame.width
@@ -91,20 +112,19 @@ public:
             d.storageMode = MTLStorageModeShared;
             d.usage = MTLTextureUsageShaderRead;
             if (frame.stride % [device_ minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm]) {
-                for (uint32_t y = 0; y < rows; ++y)
+                for (uint32_t y = first; y < end; ++y)
                     [blit copyFromBuffer:source sourceOffset:y * frame.stride toBuffer:target_ destinationOffset:y * scanout_.stride size:row];
             } else {
                 id<MTLTexture> texture = [source newTextureWithDescriptor:d offset:0 bytesPerRow:frame.stride];
                 if (!texture) {[blit endEncoding]; return kNoResource;}
-                [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                           sourceSize:MTLSizeMake(frame.width, rows, 1) toBuffer:target_ destinationOffset:0
+                [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, first, 0)
+                           sourceSize:MTLSizeMake(frame.width, end-first, 1) toBuffer:target_ destinationOffset:first*scanout_.stride
                     destinationBytesPerRow:scanout_.stride destinationBytesPerImage:scanout_.stride * frame.height];
             }
         }
+        }
         [blit endEncoding];
-        [commands commit];
-        [commands waitUntilCompleted];
-        return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
+        return finish(commands);
     }
     // A half-float frame: one thread per pixel, 16 x 8 threads a group (the kernel skips threads past the edges).
     Result convert(const Frame &frame) {
@@ -119,18 +139,24 @@ public:
         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
         id<MTLComputeCommandEncoder> encoder = commands ? [commands computeCommandEncoder] : nil;
         if (!encoder) return kNoResource;
-        const uint32_t params[4] = {frame.width, frame.height, (uint32_t)(frame.stride / 4), (uint32_t)(scanout_.stride / 4)};
         [encoder setComputePipelineState:convert_];
-        [encoder setBuffer:source offset:0 atIndex:0];
-        [encoder setBuffer:target_ offset:0 atIndex:1];
         [encoder setBuffer:tables_[encoded] offset:0 atIndex:2];
-        [encoder setBytes:params length:sizeof params atIndex:3];
-        [encoder dispatchThreadgroups:MTLSizeMake((frame.width + 15) / 16, (frame.height + 7) / 8, 1)
-                threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+        uint32_t spans[4]={0,frame.height,frame.height,frame.height};
+#ifdef NGP_OVERLAY_API
+        ngp_visible_rows(frame.height,{scanout_.overlayFirst,scanout_.overlayRows},spans);
+#endif
+        for(unsigned part=0;part<2;++part) {
+            const uint32_t first=spans[2*part],end=spans[2*part+1];
+            if(end<=first)continue;
+            const uint32_t params[4] = {frame.width, end-first, (uint32_t)(frame.stride / 4), (uint32_t)(scanout_.stride / 4)};
+            [encoder setBuffer:source offset:first*frame.stride atIndex:0];
+            [encoder setBuffer:target_ offset:first*scanout_.stride atIndex:1];
+            [encoder setBytes:params length:sizeof params atIndex:3];
+            [encoder dispatchThreadgroups:MTLSizeMake((frame.width + 15) / 16, (end-first + 7) / 8, 1)
+                    threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+        }
         [encoder endEncoding];
-        [commands commit];
-        [commands waitUntilCompleted];
-        return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
+        return finish(commands);
     }
     // A kernel of the scanout library, made once; a failure is not retried (every later half-float frame then goes back to the display
     // driver's own path, every BGRA frame to the blit).
@@ -159,6 +185,21 @@ public:
         return buffer;
     }
 private:
+    Result finish(id<MTLCommandBuffer> commands) {
+        timing_.encodeUs=elapsedUs(began_);
+        uint64_t began=nowUs();
+        [commands commit];
+        timing_.submitUs=elapsedUs(began);began=nowUs();
+        [commands waitUntilCompleted];
+        timing_.waitUs=elapsedUs(began);
+        if(commands.status!=MTLCommandBufferStatusCompleted)return kGpuFailed;
+        const double start=commands.GPUStartTime,end=commands.GPUEndTime;
+        const double us=(end-start)*1000000.0;
+        if(start>0 && end>=start && us<UINT32_MAX)timing_.gpuUs=(uint32_t)us;
+        return kOk;
+    }
+    Timing timing_{};
+    uint64_t began_=0;
     // The compositor cycles through a few surfaces and the kernel keeps each one's mapping under one id, so the GPU import (pinning and
     // mapping the pages, milliseconds per frame otherwise) is made once per surface. The kernel keeps more mappings (6) than kSources, so
     // every import cached here still has its mapping.

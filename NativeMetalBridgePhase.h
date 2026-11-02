@@ -85,11 +85,12 @@ static void *worker(void *arg) {
 // Serves the display driver's frames with the GPU on `device` (the kernel offers them only with sheng-fb-gpu=1). The calls go through a hand-off-only
 // connection to the accelerator (open type 0x4148: no GPU slot is taken): the original sandbox profiles admit that class and not the presenter's own
 // service. Reports on GPU7 only when the state changes: "P<step> e<hex>" (0 no connection, 1 no selector, 2 mode refused, 3 scanout not
-// mappable/importable, 4 serving), then "PF <frames>/<failures> r<last result> v<verified>/<differing rows> t<ms>" at the first frame, every fifth after
+// mappable/importable, 4 serving), then "PF <frames>/<failures> r<last result> v<verified>/<differing rows> t<ms>" at the first frame (every fifth with SHENG_DIAG)
 // and the first failure, "PX ..." when serving stops. Returns when serving stops.
 struct ScanoutContext {
     Gpu link;
     Gpu *marker;
+    ~ScanoutContext() {if(link.conn && link.closeFn)link.closeFn(link.conn);}
 };
 static void serveScanout(Gpu &gpu, id device) {
     // This thread carries every frame to the screen; at the default priority it waited behind the launching apps' threads.
@@ -122,9 +123,10 @@ static void serveScanout(Gpu &gpu, id device) {
         snprintf(line, sizeof line, "P%d e%x", st.step, (unsigned)st.error);
         streamText7(gpu, line);
         if (opened) {
+            const bool diagnostics=getenv("SHENG_DIAG")!=nullptr;
             uint64_t reportedFrames = 0, reportedFailures = 0;
             while (client.serveOne(500)) {
-                const bool frame = st.frames && (st.frames == 1 || st.frames - reportedFrames >= 5);
+                const bool frame = st.frames && (reportedFrames==0 || (diagnostics && st.frames - reportedFrames >= 5));
                 if (frame || (st.failures && !reportedFailures)) {
                     reportedFrames = st.frames ? st.frames : reportedFrames;
                     reportedFailures = st.failures ? st.failures : reportedFailures;
