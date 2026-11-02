@@ -20,6 +20,7 @@
 // The conversion kernel's AIR and the frontend's loader for bare AIR (both in the plugin; weak, so a device without them only blits).
 extern "C" const void *nmb_scanout_convert_air(size_t *length) __attribute__((weak_import));
 extern "C" id native_bridge_metal_library_with_air(const void *bytes, size_t length) __attribute__((weak_import));
+extern "C" void NBTraceScanoutCommand(id command,uint64_t sequence,uint64_t source,uint64_t target) __attribute__((weak_import));
 
 namespace gpupresent {
 
@@ -41,6 +42,7 @@ struct Frame {
     uint32_t width, height;
     uint32_t mapping; // the kernel's id for this mapping of the surface (0: none, imported for this frame only)
     uint32_t format;  // NGP_BGRX8888, NGP_RGBA16F_LINEAR or NGP_RGBA16F_ENCODED
+    uint64_t sequence=0;
 };
 
 enum Result { kOk = 0, kBadFrame, kBadScanout, kNoResource, kGpuFailed };
@@ -93,7 +95,7 @@ public:
                 [encoder dispatchThreadgroups:MTLSizeMake((frame.width + 15) / 16, (end-first + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
             }
             [encoder endEncoding];
-            return finish(commands);
+            return finish(commands,frame);
         }
         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
         id<MTLBlitCommandEncoder> blit = commands ? [commands blitCommandEncoder] : nil;
@@ -124,7 +126,7 @@ public:
         }
         }
         [blit endEncoding];
-        return finish(commands);
+        return finish(commands,frame);
     }
     // A half-float frame: one thread per pixel, 16 x 8 threads a group (the kernel skips threads past the edges).
     Result convert(const Frame &frame) {
@@ -156,7 +158,7 @@ public:
                     threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
         }
         [encoder endEncoding];
-        return finish(commands);
+        return finish(commands,frame);
     }
     // A kernel of the scanout library, made once; a failure is not retried (every later half-float frame then goes back to the display
     // driver's own path, every BGRA frame to the blit).
@@ -185,7 +187,8 @@ public:
         return buffer;
     }
 private:
-    Result finish(id<MTLCommandBuffer> commands) {
+    Result finish(id<MTLCommandBuffer> commands,const Frame &frame) {
+        if(NBTraceScanoutCommand)NBTraceScanoutCommand(commands,frame.sequence,(uintptr_t)frame.base,(uintptr_t)scanout_.base);
         timing_.encodeUs=elapsedUs(began_);
         uint64_t began=nowUs();
         [commands commit];
