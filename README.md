@@ -14,7 +14,7 @@ The scanout client negotiates an optional diagnostic row band and excludes it fr
 
 Optional heap aliasing now forwards buffer/texture/view ownership and offsets to the pinned runtime, allowing automatic heaps to reuse storage while old objects remain retained. The real frontend/Rust host regression and old-code control cover reuse and destruction; this is separate from phone GPU performance.
 
-The current main frontend and 24 runtime patches use metal2vulkan 624bab3918de5b978e1101517abca2b4fa426565. The A830 plugin build supplies six shader processors to gpuCoreCount; this is topology for MPS sizing, not an active-core measurement. Existing heap alias forwarding and the board's negotiated overlay band are retained.
+The current main frontend and 26 runtime patches use metal2vulkan 624bab3918de5b978e1101517abca2b4fa426565. The A830 plugin build supplies six shader processors to gpuCoreCount; this is topology for MPS sizing, not an active-core measurement. Existing heap alias forwarding and the board's negotiated overlay band are retained.
 
 The build checks the plugin, frontend and probe syntax before compiling the Rust bridge. The iPadOS 27 framebuffer experiment and its helper are limited to arm64e builds.
 
